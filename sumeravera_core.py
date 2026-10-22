@@ -9,10 +9,11 @@ import socket
 import hmac
 import hashlib
 import time
+import os
 
 HOST = '127.0.0.1'
 PORT = 8888
-SECRET_KEY = b"digiparamara-secure-master-key"
+SECRET_KEY = os.environ.get("SUMER_SECRET_ZERO_DRIFT", "digiparamara-secure-master-key").encode('utf-8')
 
 class DigiParaMaraNode:
     def __init__(self, host=HOST, port=PORT):
@@ -20,6 +21,7 @@ class DigiParaMaraNode:
         self.host = host
         self.port = port
         self.nonce_cache = {}
+        self.buffers = {}
 
     def start_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -44,44 +46,64 @@ class DigiParaMaraNode:
     def accept(self, sock, mask):
         conn, addr = sock.accept()
         conn.setblocking(False)
+        self.buffers[conn] = bytearray()
         self.selector.register(conn, selectors.EVENT_READ, self.read)
 
     def read(self, conn, mask):
         try:
-            data = conn.recv(1024)
-            if not data:
-                self.selector.unregister(conn)
-                conn.close()
+            chunk = conn.recv(1024)
+            if not chunk:
+                self.close_connection(conn)
                 return
 
-            if self.validate_payload(data):
-                conn.sendall(b"ACK: STATE_INVARIANT_VERIFIED\n")
-            else:
-                conn.sendall(b"REJECT: INGRESS_VALIDATION_FAILED\n")
-        except (ConnectionResetError, BlockingIOError):
+            self.buffers[conn].extend(chunk)
+           
+            while len(self.buffers[conn]) >= 56:
+                packet = bytes(self.buffers[conn][:56])
+                del self.buffers[conn][:56]
+
+                if self.validate_payload(packet):
+                    conn.sendall(b"ACK: AUTHENTICATED_FRESHNESS_VERIFIED\n")
+                else:
+                    conn.sendall(b"REJECT: INGRESS_VALIDATION_FAILED\n")
+                   
+        except (ConnectionResetError, BrokenPipeError, BlockingIOError):
+            self.close_connection(conn)
+
+    def close_connection(self, conn):
+        try:
+            self.selector.unregister(conn)
+        except Exception:
             pass
+        if conn in self.buffers:
+            del self.buffers[conn]
+        conn.close()
 
     def validate_payload(self, payload: bytes) -> bool:
-        if len(payload) < 56:
+        if len(payload) != 56:
             return False
 
         received_hmac = payload[:32]
-        timestamp = int.from_bytes(payload[32:40], 'big')
-        nonce = payload[40:56]
+        body = payload[32:]
 
-        current_time = int(time.time())
-        if abs(current_time - timestamp) > 30:
+        expected = hmac.new(SECRET_KEY, body, hashlib.sha256).digest()
+        if not hmac.compare_digest(received_hmac, expected):
             return False
 
-        nonce_key = (nonce, timestamp)
+        timestamp = int.from_bytes(body[:8], 'big')
+        nonce = body[8:]
+
+        now = int(time.time())
+        if abs(now - timestamp) > 30:
+            return False
+
+        self.nonce_cache = {k: v for k, v in self.nonce_cache.items() if now - v < 60}
+        nonce_key = (bytes(nonce), timestamp)
         if nonce_key in self.nonce_cache:
             return False
 
-        self.nonce_cache = {k: v for k, v in self.nonce_cache.items() if current_time - v < 60}
-        self.nonce_cache[nonce_key] = current_time
-
-        computed_hmac = hmac.new(SECRET_KEY, payload[32:], hashlib.sha256).digest()
-        return hmac.compare_digest(received_hmac, computed_hmac)
+        self.nonce_cache[nonce_key] = now
+        return True
 
 if __name__ == '__main__':
     node = DigiParaMaraNode()
